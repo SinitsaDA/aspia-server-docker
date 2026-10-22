@@ -222,7 +222,13 @@ run `aspia_update --check` and accept the update to 3.1.
 ## Backups
 
 Before each update the container saves the settings and the database to `aspia/data/backups`
-(or `aspia-store/backups`). Manual copy: Winbox → Files, folders `aspia/etc` and `aspia/data`.
+(or `aspia-store/backups`). A backup takes tens of kilobytes (settings and database only, compressed),
+the **last 5** are kept, older ones are removed automatically. To keep fewer, e.g. 2
+(then restart the container):
+```
+/container/envs/add list=aspia key=KEEP_BACKUPS value="2"
+```
+Manual copy: Winbox → Files, folders `aspia/etc` and `aspia/data`.
 
 ## Troubleshooting
 

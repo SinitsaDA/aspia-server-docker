@@ -222,7 +222,13 @@ aspia_update --check
 ## Бэкапы
 
 Перед каждым обновлением контейнер сохраняет настройки и базу в `aspia/data/backups`
-(или `aspia-store/backups`). Скопировать вручную: Winbox → Files, папки `aspia/etc` и `aspia/data`.
+(или `aspia-store/backups`). Бэкап весит десятки килобайт (только настройки и база, сжатые),
+хранятся **5 последних** — старые удаляются автоматически. Хранить меньше, например 2
+(затем перезапустить контейнер):
+```
+/container/envs/add list=aspia key=KEEP_BACKUPS value="2"
+```
+Скопировать вручную: Winbox → Files, папки `aspia/etc` и `aspia/data`.
 
 ## Устранение неполадок
 
