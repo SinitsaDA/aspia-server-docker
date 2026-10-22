@@ -1,0 +1,372 @@
+name: ARM images
+
+# Aspia Router + Relay for ARM:
+#  - armv7: built here from the sources (the developer of Aspia does not build for armv7);
+#  - arm64: taken from the CI artifacts of the Aspia repository (kept there for 7 days);
+#  - release "aspia-<version>": archives for the self-update inside the container
+#    (aspia-server-<version>-linux-<arch>[-upx].tar.gz + .sha256);
+#  - images: ghcr.io/<owner>/aspia-server-arm (armv7 + arm64), ghcr.io/<owner>/aspia-server-mikrotik
+#    (UPX-compressed binaries and a minimal system for the built-in flash of MikroTik routers).
+# The x86_64 images (publish.yml) are not touched.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "arm/**"
+      - ".github/workflows/arm.yml"
+  schedule:
+    - cron: "37 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Aspia version to build (empty = latest release)"
+        required: false
+        default: ""
+      force:
+        description: "Build the binaries again even if they are published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: arm
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: dchapyshev/aspia
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      latest: ${{ steps.version.outputs.latest }}
+      minor_latest: ${{ steps.version.outputs.minor_latest }}
+      legacy: ${{ steps.version.outputs.legacy }}
+      build_armv7: ${{ steps.decide.outputs.build_armv7 }}
+      get_arm64: ${{ steps.decide.outputs.get_arm64 }}
+      build_images: ${{ steps.decide.outputs.build_images }}
+    steps:
+      - name: Aspia version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          tags="$(gh api "repos/${UPSTREAM}/releases?per_page=100" \
+            -q '.[] | select(.draft == false and .prerelease == false) | .tag_name' | sed 's/^v//')"
+          latest="$(gh api "repos/${UPSTREAM}/releases/latest" -q .tag_name)"
+          latest="${latest#v}"
+          version="${INPUT_VERSION:-$latest}"
+          version="${version#v}"
+          [[ "${version}" =~ ^[0-9]+(\.[0-9]+)+$ ]] || { echo "Bad version: ${version}"; exit 1; }
+          minor="${version%.*}"
+          newest_in_minor="$(grep -E "^${minor//./\\.}\.[0-9]+$" <<<"${tags}" | sort -V | tail -n 1)"
+          {
+            echo "version=${version}"
+            echo "tag=aspia-${version}"
+            echo "latest=$([[ "${version}" == "${latest}" ]] && echo true || echo false)"
+            echo "minor_latest=$([[ "${version}" == "${newest_in_minor}" ]] && echo true || echo false)"
+            # 3.1 removed the 2.x hosts and the 2.x migration
+            echo "legacy=$([[ "${version}" == 2.* || "${version}" == 3.0.* ]] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+          echo "Aspia ${version} (latest release: ${latest}, newest ${minor}.x: ${newest_in_minor})"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Decide what to build
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          assets="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets -q '.assets[].name' 2>/dev/null || true)"
+          has() { grep -qxF "$1" <<<"${assets}"; }
+          name="aspia-server-${VERSION}-linux"
+
+          build_armv7=true
+          has "${name}-armv7.tar.gz.sha256" && has "${name}-armv7-upx.tar.gz.sha256" && build_armv7=false
+          [[ "${FORCE}" == "true" ]] && build_armv7=true
+
+          # arm64 comes from the CI artifacts of Aspia, they are kept for 7 days after the release
+          get_arm64=true
+          has "${name}-arm64.tar.gz.sha256" && has "${name}-arm64-upx.tar.gz.sha256" && get_arm64=false
+          published="$(gh api "repos/${UPSTREAM}/releases/tags/v${VERSION}" -q .published_at)"
+          (( $(date +%s) - $(date -d "${published}" +%s) > 7 * 86400 )) && get_arm64=false
+
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          build_images=true
+          if [[ "${EVENT}" == "schedule" && "${build_armv7}" == "false" ]] &&
+             docker manifest inspect "ghcr.io/${owner}/aspia-server-mikrotik:${VERSION}" >/dev/null 2>&1; then
+            build_images=false
+          fi
+          {
+            echo "build_armv7=${build_armv7}"
+            echo "get_arm64=${get_arm64}"
+            echo "build_images=${build_images}"
+          } >> "$GITHUB_OUTPUT"
+          echo "armv7: ${build_armv7}, arm64: ${get_arm64}, images: ${build_images}"
+
+  armv7:
+    needs: prepare
+    if: needs.prepare.outputs.build_armv7 == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@v7
+
+      # The build runs a few ARM tools through QEMU.
+      - name: QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm
+
+      - name: Restore the vcpkg cache
+        id: cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            work/vcpkg-cache
+            work/vcpkg-downloads
+          key: armv7-vcpkg-${{ hashFiles('arm/builder/Dockerfile', 'arm/builder/triplets/**') }}-${{ github.run_id }}
+          restore-keys: |
+            armv7-vcpkg-${{ hashFiles('arm/builder/Dockerfile', 'arm/builder/triplets/**') }}-
+            armv7-vcpkg-
+
+      # One-time seed of the cache (a draft release, readable only by the owner) - saves hours on the
+      # first run; the draft is removed once the cache exists.
+      - name: Seed the vcpkg cache
+        if: steps.cache.outputs.cache-matched-key == ''
+        run: |
+          mkdir -p work
+          if gh release download vcpkg-cache-seed --repo "${GITHUB_REPOSITORY}" --pattern 'vcpkg-cache.tar.part-*' --dir seed; then
+            cat seed/vcpkg-cache.tar.part-* | tar -xf - -C work
+            rm -rf seed
+          fi
+          du -sh work/* 2>/dev/null || true
+
+      - name: Builder image
+        run: docker build -t aspia-armv7-builder arm/builder
+
+      - name: Build
+        id: build
+        run: |
+          docker run --rm -v "${PWD}/work:/work" -v "${PWD}/arm/builder:/scripts:ro" \
+            aspia-armv7-builder bash /scripts/build.sh "${VERSION}"
+          sudo chown -R "$(id -u):$(id -g)" work
+
+      # Saved even after a failure or a timeout: the next run continues with the packages built so far.
+      - name: Save the vcpkg cache
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            work/vcpkg-cache
+            work/vcpkg-downloads
+          key: armv7-vcpkg-${{ hashFiles('arm/builder/Dockerfile', 'arm/builder/triplets/**') }}-${{ github.run_id }}
+
+      - name: Remove the cache seed
+        if: success()
+        run: gh release delete vcpkg-cache-seed --repo "${GITHUB_REPOSITORY}" --yes 2>/dev/null || true
+
+      - name: Upload to the release
+        run: |
+          if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --prerelease --target "${GITHUB_SHA}" \
+              --title "Aspia ${VERSION} for ARM" \
+              --notes "Aspia Router + Relay ${VERSION} for ARM: archives for the self-update of the images \`aspia-server-arm\` and \`aspia-server-mikrotik\` (see docs/mikrotik-container.md). Built from https://github.com/${UPSTREAM}/releases/tag/v${VERSION}; armv7 is built by this repository, arm64 is taken from the CI of Aspia."
+          fi
+          gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "work/out/aspia-server-${VERSION}-linux-armv7"*
+
+  arm64:
+    needs: prepare
+    if: needs.prepare.outputs.get_arm64 == 'true'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    outputs:
+      uploaded: ${{ steps.upload.outputs.uploaded }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download the CI build of Aspia
+        run: |
+          sha="$(gh api "repos/${UPSTREAM}/commits/v${VERSION}" -q .sha)"
+          artifact="$(gh api "repos/${UPSTREAM}/actions/runs?head_sha=${sha}&per_page=50" -q '.workflow_runs[].id' |
+            while read -r run; do
+              gh api "repos/${UPSTREAM}/actions/runs/${run}/artifacts" \
+                -q '.artifacts[] | select(.name == "build-rpios12-arm64-release" and .expired == false) | .id'
+            done | head -n 1)"
+          if [[ -z "${artifact}" ]]; then
+            echo "::warning::No arm64 build of Aspia ${VERSION} (the artifacts are kept for 7 days)"
+            exit 1
+          fi
+          gh api "repos/${UPSTREAM}/actions/artifacts/${artifact}/zip" > arm64.zip
+          mkdir -p ci && unzip -q arm64.zip -d ci
+          find ci -name '*.deb' -printf '%f\n'
+
+      - name: Pack
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq upx-ucl
+          mkdir -p deb plain out
+          find ci \( -name 'aspia-router*.deb' -o -name 'aspia-relay*.deb' \) -exec dpkg-deb -x {} deb \;
+          for bin in aspia_router aspia_relay; do
+            cp "$(find deb -type f -name "${bin}" | head -n 1)" plain/
+          done
+          file plain/*
+          file plain/aspia_router | grep -q aarch64
+          pack() {
+            tar -czf "out/$2" -C "$1" aspia_router aspia_relay
+            (cd out && sha256sum "$2" > "$2.sha256")
+          }
+          pack plain "aspia-server-${VERSION}-linux-arm64.tar.gz"
+          cp -r plain upx
+          upx --best --lzma -q upx/aspia_router upx/aspia_relay
+          pack upx "aspia-server-${VERSION}-linux-arm64-upx.tar.gz"
+          ls -la out
+
+      - name: Upload to the release
+        id: upload
+        run: |
+          for _ in $(seq 1 60); do
+            gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 && break
+            sleep 60    # the armv7 job creates the release
+          done
+          gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber out/*
+          echo "uploaded=true" >> "$GITHUB_OUTPUT"
+
+  images:
+    needs: [prepare, armv7, arm64]
+    # also when only the arm64 binaries were added to an already published version
+    if: >-
+      always() && needs.armv7.result != 'failure' && needs.armv7.result != 'cancelled' &&
+      (needs.prepare.outputs.build_images == 'true' || needs.arm64.outputs.uploaded == 'true')
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Binaries from the release
+        id: bins
+        run: |
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --pattern "aspia-server-${VERSION}-linux-*" --dir dl
+          platforms=""
+          for arch in armv7 arm64; do
+            for flavor in "" "-upx"; do
+              name="aspia-server-${VERSION}-linux-${arch}${flavor}.tar.gz"
+              [[ -f "dl/${name}" ]] || continue
+              (cd dl && sha256sum -c "${name}.sha256")
+              dir="arm/runtime/bin${flavor}/${arch}"
+              mkdir -p "${dir}" && tar -xzf "dl/${name}" -C "${dir}"
+            done
+            if [[ -f "arm/runtime/bin/${arch}/aspia_router" && -f "arm/runtime/bin-upx/${arch}/aspia_router" ]]; then
+              platforms="${platforms:+${platforms},}linux/$([[ "${arch}" == armv7 ]] && echo arm/v7 || echo arm64)"
+            fi
+          done
+          [[ -n "${platforms}" ]] || { echo "No binaries in the release ${TAG}"; exit 1; }
+          echo "platforms=${platforms}" >> "$GITHUB_OUTPUT"
+          echo "platforms: ${platforms}"
+
+      - name: Tags
+        id: tags
+        env:
+          LATEST: ${{ needs.prepare.outputs.latest }}
+          MINOR_LATEST: ${{ needs.prepare.outputs.minor_latest }}
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          for image in arm mikrotik; do
+            name="ghcr.io/${owner}/aspia-server-${image}"
+            tags="${name}:${VERSION}"
+            [[ "${MINOR_LATEST}" == "true" ]] && tags="${tags},${name}:${VERSION%.*}"
+            [[ "${LATEST}" == "true" ]] && tags="${tags},${name}:latest"
+            echo "${image}=${tags}" >> "$GITHUB_OUTPUT"
+            echo "${image}: ${tags}"
+          done
+
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm,arm64
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Smoke test (armv7, emulated)
+        env:
+          AUTO_UPDATE: ${{ needs.prepare.outputs.legacy == 'true' && '0' || '1' }}
+        run: |
+          for file in Dockerfile Dockerfile.mikrotik; do
+            docker buildx build --platform linux/arm/v7 --load -t "aspia-test:${file}" -f "arm/runtime/${file}" \
+              --build-arg "ASPIA_VERSION=${VERSION}" --build-arg "AUTO_UPDATE=${AUTO_UPDATE}" arm/runtime
+            docker run -d --name test --platform linux/arm/v7 -e EXTERNAL_IP=127.0.0.1 -e AUTO_UPDATE=0 "aspia-test:${file}"
+            ok=false
+            for _ in $(seq 1 36); do
+              sleep 5
+              docker exec test aspia_health >/dev/null 2>&1 && { ok=true; break; }
+            done
+            docker logs test 2>&1 | grep -v "Password:"
+            docker exec test aspia_router --version | grep -F "${VERSION}"
+            docker rm -f test
+            [[ "${ok}" == "true" ]] || { echo "${file}: the server did not become healthy"; exit 1; }
+          done
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Push aspia-server-arm
+        uses: docker/build-push-action@v7
+        with:
+          context: ./arm/runtime
+          file: ./arm/runtime/Dockerfile
+          platforms: ${{ steps.bins.outputs.platforms }}
+          build-args: |
+            ASPIA_VERSION=${{ env.VERSION }}
+            AUTO_UPDATE=${{ needs.prepare.outputs.legacy == 'true' && '0' || '1' }}
+          push: true
+          tags: ${{ steps.tags.outputs.arm }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+
+      - name: Push aspia-server-mikrotik
+        uses: docker/build-push-action@v7
+        with:
+          context: ./arm/runtime
+          file: ./arm/runtime/Dockerfile.mikrotik
+          platforms: ${{ steps.bins.outputs.platforms }}
+          build-args: |
+            ASPIA_VERSION=${{ env.VERSION }}
+            AUTO_UPDATE=${{ needs.prepare.outputs.legacy == 'true' && '0' || '1' }}
+          push: true
+          tags: ${{ steps.tags.outputs.mikrotik }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ env.VERSION }}

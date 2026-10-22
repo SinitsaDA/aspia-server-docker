@@ -1,0 +1,5 @@
+#!/bin/bash
+# Runs the aspia_router of the version selected by aspia_start (image or self-updated).
+BIN_DIR="$(cat /run/aspia/bin_dir 2>/dev/null)"
+[[ -x "${BIN_DIR}/aspia_router" ]] || BIN_DIR="/opt/aspia/${ASPIA_VERSION}"
+exec "${BIN_DIR}/aspia_router" "$@"

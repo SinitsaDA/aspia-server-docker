@@ -1,0 +1,246 @@
+#!/bin/bash
+#
+# Prepares the configuration and supervises Aspia Router and Aspia Relay.
+#  - no configuration:          creates a new one (user admin / admin);
+#  - configuration of 2.x:      the services convert it on start (*.json -> *.conf, *.json.bak kept);
+#  - on every start:            EXTERNAL_IP and the router public key are written to the relay config.
+#
+# The script stays the main process of the container and never exits on its own (RouterOS has no
+# restart policy): a crashed service is started again, and aspia_update can pause the services
+# (SIGUSR1 + /run/aspia/pause) to update them in place.
+# The binaries come from /var/lib/aspia/versions/<version> (installed by aspia_update) or, when
+# that is older or missing, from the image itself (/opt/aspia/<image version>).
+
+CONFIG_DIR=/etc/aspia
+DATA_DIR=/var/lib/aspia
+RUN_DIR=/run/aspia
+
+# Downloaded versions and backups of the self-update: on a separate mount /var/lib/aspia-store when
+# there is one (e.g. on USB, while the database stays in the built-in flash of MikroTik), otherwise
+# next to the database. STORE_DIR=<dir> sets it explicitly.
+if [[ -z "${STORE_DIR}" ]]; then
+    STORE_DIR=/var/lib/aspia-store
+    mountpoint -q "${STORE_DIR}" 2>/dev/null || STORE_DIR=${DATA_DIR}
+fi
+export STORE_DIR
+VERSIONS_DIR=${STORE_DIR}/versions
+
+# Log files of the services grow fast, so they are off by default and only errors are shown in the
+# container log. LOGS=1 writes the full logs to /var/log/aspia as Aspia does by default.
+if [[ "${LOGS:-0}" != "1" ]]; then
+    export ASPIA_LOG_TO_FILE=0 ASPIA_LOG_TO_STDOUT=1
+    export ASPIA_LOG_LEVEL=${ASPIA_LOG_LEVEL:-3}    # 0 trace, 1 info, 2 warning, 3 error
+fi
+
+ROUTER_CONF=${CONFIG_DIR}/router.conf
+RELAY_CONF=${CONFIG_DIR}/relay.conf
+ROUTER_LEGACY_CONF=${CONFIG_DIR}/router.json
+RELAY_LEGACY_CONF=${CONFIG_DIR}/relay.json
+LEGACY_PUBLIC_KEY=${CONFIG_DIR}/router.pub
+HOST_PUBLIC_KEY=${CONFIG_DIR}/host.pub
+RELAY_PUBLIC_KEY=${CONFIG_DIR}/relay.pub
+
+TIMESTAMP="$(date +%Y-%m-%d_%H-%M)"
+
+trap 'exit 143' SIGINT SIGTERM
+
+# ini_set <file> <section> <key> <value>
+ini_set() {
+    awk -v section="[$2]" -v key="$3" -v value="$4" '
+        $0 == section { in_section = 1; print; next }
+        /^\[/ { if (in_section && !done) { print key "=" value; done = 1 } in_section = 0 }
+        in_section && index($0, key "=") == 1 { print key "=" value; done = 1; next }
+        { print }
+        END { if (!done) { if (!in_section) print section; print key "=" value } }
+    ' "$1" > "$1.tmp" && cat "$1.tmp" > "$1" && rm -f "$1.tmp"
+}
+
+# json_set <file> <key> <value>
+json_set() {
+    jq --arg value "$3" ".$2 = \$value" "$1" > "$1.tmp" && cat "$1.tmp" > "$1" && rm -f "$1.tmp"
+}
+
+# version_gt <a> <b>: a is newer than b
+version_gt() {
+    [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]
+}
+
+# Chooses the binaries: the version selected by aspia_update, unless the image brings a newer one.
+select_binaries() {
+    local current=""
+    [[ -f "${VERSIONS_DIR}/current" ]] && current="$(tr -d '[:space:]' < "${VERSIONS_DIR}/current")"
+
+    if [[ -n "${current}" && -x "${VERSIONS_DIR}/${current}/aspia_router" ]] &&
+       ! version_gt "${ASPIA_VERSION}" "${current}"; then
+        BIN_DIR="${VERSIONS_DIR}/${current}"
+        RUNNING_VERSION="${current}"
+    else
+        BIN_DIR="/opt/aspia/${ASPIA_VERSION}"
+        RUNNING_VERSION="${ASPIA_VERSION}"
+    fi
+
+    mkdir -p "${RUN_DIR}"
+    echo "${RUNNING_VERSION}" > "${RUN_DIR}/version"
+    echo "${BIN_DIR}" > "${RUN_DIR}/bin_dir"
+}
+
+mkdir -p "${CONFIG_DIR}" "${DATA_DIR}" "${VERSIONS_DIR}" "${RUN_DIR}"
+rm -f "${RUN_DIR}/pause"
+select_binaries
+
+echo "Aspia Server ${RUNNING_VERSION} ($(uname -m), binaries: ${BIN_DIR})"
+
+# ---------- Router ----------
+
+if [[ -f "${ROUTER_CONF}" ]]; then
+    echo "Router configuration: ${ROUTER_CONF}"
+elif [[ -f "${ROUTER_LEGACY_CONF}" ]]; then
+    echo "Router configuration of 2.x: ${ROUTER_LEGACY_CONF}, it will be migrated on start"
+else
+    echo "Router configuration not found, creating a new one..."
+
+    for file in "${DATA_DIR}/router.db3" "${HOST_PUBLIC_KEY}" "${RELAY_PUBLIC_KEY}"; do
+        if [[ -f "${file}" ]]; then
+            echo "Moving stale ${file} to ${file}_${TIMESTAMP}"
+            mv "${file}" "${file}_${TIMESTAMP}"
+        fi
+    done
+
+    "${BIN_DIR}/aspia_router" --create-config || exit 1
+fi
+
+# After migration from 2.x hosts and relays keep using the single old key pair.
+if [[ -f "${LEGACY_PUBLIC_KEY}" ]]; then
+    for file in "${HOST_PUBLIC_KEY}" "${RELAY_PUBLIC_KEY}"; do
+        [[ -f "${file}" ]] || cp "${LEGACY_PUBLIC_KEY}" "${file}"
+    done
+fi
+
+# ---------- Relay ----------
+
+if [[ -f "${RELAY_CONF}" ]]; then
+    echo "Relay configuration: ${RELAY_CONF}"
+elif [[ -f "${RELAY_LEGACY_CONF}" ]]; then
+    echo "Relay configuration of 2.x: ${RELAY_LEGACY_CONF}, it will be migrated on start"
+else
+    echo "Relay configuration not found, creating a new one..."
+    "${BIN_DIR}/aspia_relay" --create-config || exit 1
+fi
+
+# EXTERNAL_IP=auto: ask public services for the address this server is seen from.
+if [[ "${EXTERNAL_IP,,}" == "auto" ]]; then
+    EXTERNAL_IP=""
+    for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+        ip="$(curl -fsS --max-time 5 "${url}" 2>/dev/null | tr -d '[:space:]')"
+        if [[ "${ip}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "${ip}" =~ ^[0-9a-fA-F:]+:[0-9a-fA-F:]*$ ]]; then
+            EXTERNAL_IP="${ip}"
+            echo "External IP detected via ${url}: ${EXTERNAL_IP}"
+            break
+        fi
+    done
+    [[ -n "${EXTERNAL_IP}" ]] || echo "WARNING: unable to detect the external IP"
+fi
+
+[[ -n "${EXTERNAL_IP}" ]] || echo "WARNING: EXTERNAL_IP is not set - clients will not be able to reach the relay!"
+
+PUBLIC_KEY=""
+[[ -f "${RELAY_PUBLIC_KEY}" ]] && PUBLIC_KEY="$(tr -d '[:space:]' < "${RELAY_PUBLIC_KEY}")"
+
+if [[ -f "${RELAY_CONF}" ]]; then
+    [[ -n "${EXTERNAL_IP}" ]] && ini_set "${RELAY_CONF}" peer public_address "${EXTERNAL_IP}"
+    [[ -n "${PUBLIC_KEY}" ]] && ini_set "${RELAY_CONF}" router public_key "${PUBLIC_KEY}"
+else
+    # Written to the 2.x config, the relay carries the values over during migration.
+    [[ -n "${EXTERNAL_IP}" ]] && json_set "${RELAY_LEGACY_CONF}" PeerAddress "${EXTERNAL_IP}"
+    [[ -n "${PUBLIC_KEY}" ]] && json_set "${RELAY_LEGACY_CONF}" RouterPublicKey "${PUBLIC_KEY}"
+fi
+
+echo "------------------------------------------------------------------------"
+echo " External IP (relay):  ${EXTERNAL_IP:-<not set>}"
+echo " Public key for hosts: $(tr -d '[:space:]' < "${HOST_PUBLIC_KEY}" 2>/dev/null || echo '<not found>')"
+echo " Ports: 8060/tcp hosts 2.x, 8061/tcp hosts 3.x, 8062/tcp consoles,"
+echo "        8065/udp STUN, 8070/tcp relay"
+echo " Self-update: $([[ "${AUTO_UPDATE:-1}" == "1" ]] && echo "daily at ${UPDATE_TIME:-04:00}" || echo "off (check manually: aspia_update --check)")"
+echo "------------------------------------------------------------------------"
+
+# ---------- Supervision ----------
+
+ROUTER_PID=""
+RELAY_PID=""
+
+# Harmless messages of every start in a container: no systemd login monitor, SIGKILL/SIGSTOP cannot
+# be caught by any process. Everything else is passed through.
+log_filter() {
+    grep --line-buffered -v -E 'sd_login_monitor_new failed|Unable to install signal handler for SIG(KILL|STOP)|^[[:space:]]*$'
+}
+
+start_services() {
+    STARTED_AT=${SECONDS}
+    "${BIN_DIR}/aspia_router" > >(log_filter) 2>&1 & ROUTER_PID=$!
+    echo "aspia_router ${RUNNING_VERSION} started (pid ${ROUTER_PID})"
+    # Give the router time to open its ports, otherwise the relay retries only after 15 seconds.
+    sleep 2
+    "${BIN_DIR}/aspia_relay" > >(log_filter) 2>&1 & RELAY_PID=$!
+    echo "aspia_relay ${RUNNING_VERSION} started (pid ${RELAY_PID})"
+}
+
+stop_services() {
+    [[ -n "${ROUTER_PID}${RELAY_PID}" ]] || return 0
+    kill ${ROUTER_PID} ${RELAY_PID} 2>/dev/null
+    wait ${ROUTER_PID} ${RELAY_PID} 2>/dev/null
+    ROUTER_PID=""
+    RELAY_PID=""
+}
+
+on_term() {
+    echo "Stopping..."
+    stop_services
+    exit 0
+}
+
+# SIGUSR1 from aspia_update: stop the services while /run/aspia/pause exists, then start them again
+# with the binaries selected by then.
+on_usr1() {
+    if [[ -f "${RUN_DIR}/pause" ]]; then
+        echo "Pausing the services for the update..."
+        stop_services
+        while [[ -f "${RUN_DIR}/pause" ]]; do sleep 1; done
+    else
+        echo "Restarting the services..."
+        stop_services
+    fi
+    select_binaries
+}
+
+trap on_term SIGINT SIGTERM
+trap on_usr1 SIGUSR1
+
+echo $$ > "${RUN_DIR}/supervisor.pid"
+
+# Self-update in the background (logs go to stdout and /var/log/aspia/update.log).
+if [[ "${AUTO_UPDATE:-1}" == "1" ]]; then
+    aspia_update --daemon &
+fi
+
+CRASHES=0
+while true; do
+    [[ -n "${ROUTER_PID}" ]] || start_services
+
+    wait -n ${ROUTER_PID} ${RELAY_PID}
+    code=$?
+
+    # Interrupted by SIGUSR1 (code > 128): the services were stopped on purpose.
+    if [[ -z "${ROUTER_PID}" ]]; then
+        CRASHES=0
+        continue
+    fi
+
+    # A service has died: restart both, with a growing pause if it keeps happening.
+    (( SECONDS - STARTED_AT > 600 )) && CRASHES=0
+    CRASHES=$((CRASHES + 1))
+    delay=$(( CRASHES > 6 ? 60 : CRASHES * 5 ))
+    echo "A service has exited (code ${code}), restarting both in ${delay}s (crash #${CRASHES})"
+    stop_services
+    sleep "${delay}" & wait $!
+    select_binaries
+done

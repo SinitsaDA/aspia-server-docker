@@ -4,3 +4,6 @@ backups/
 import/
 update.log
 .update.lock/
+arm/runtime/bin/
+arm/runtime/bin-upx/
+work/

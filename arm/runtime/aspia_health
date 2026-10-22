@@ -1,0 +1,36 @@
+#!/bin/bash
+#
+# Container health: the router accepts relays, the relay accepts peers and is connected to the router.
+# Only /proc/net/tcp* is read, so the check does not open connections that would clutter the logs.
+
+RELAY_CONF=/etc/aspia/relay.conf
+
+# ini_get <file> <section> <key> <default>
+ini_get() {
+    local value
+    value="$(awk -v section="[$2]" -v key="$3" '
+        /^\[/ { in_section = ($0 == section) }
+        in_section && index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }
+    ' "$1" 2>/dev/null)"
+    echo "${value:-$4}"
+}
+
+# tcp_state <state hex> <local|remote> <port>
+tcp_state() {
+    local port column
+    port="$(printf '%04X' "$3")"
+    [[ "$2" == "local" ]] && column=2 || column=3
+    awk -v state="$1" -v column="${column}" -v port=":${port}" '
+        FNR > 1 && $4 == state && substr($column, length($column) - 4) == port { found = 1 }
+        END { exit !found }
+    ' /proc/net/tcp /proc/net/tcp6
+}
+
+ROUTER_PORT="$(ini_get "${RELAY_CONF}" router port 8063)"
+PEER_PORT="$(ini_get "${RELAY_CONF}" peer port 8070)"
+
+tcp_state 0A local "${ROUTER_PORT}" || { echo "router is not listening on ${ROUTER_PORT}"; exit 1; }
+tcp_state 0A local "${PEER_PORT}" || { echo "relay is not listening on ${PEER_PORT}"; exit 1; }
+tcp_state 01 remote "${ROUTER_PORT}" || { echo "relay is not connected to the router"; exit 1; }
+
+echo "ok"

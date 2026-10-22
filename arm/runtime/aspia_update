@@ -1,0 +1,398 @@
+#!/bin/bash
+#
+# Self-update of Aspia Router and Relay inside the container (no Docker socket needed - works on
+# MikroTik RouterOS as well).
+#
+#   aspia_update --check             show the installed and the latest version, ask before updating
+#   aspia_update --now               check once and install a fresh release right away
+#   aspia_update --version 3.1.2     install exactly this version (also a downgrade)
+#   aspia_update --daemon            run on start and every day at UPDATE_TIME (used by aspia_start)
+#   aspia_update --status            show installed versions and the last log lines
+#
+# Steps: download the binaries of the new version for this CPU (archive + sha256) to
+# /var/lib/aspia/versions/<version> -> check that they start and report that version ->
+# pause the services -> back up /etc/aspia and the database -> switch to the new version ->
+# wait until the server is healthy -> otherwise restore the backup and the previous version.
+#
+# Settings (environment): AUTO_UPDATE=1, UPDATE_TIME=04:00, MIN_AGE_DAYS=2, KEEP_BACKUPS=5,
+# KEEP_VERSIONS=2 (1 - little space: only one downloaded version), HEALTH_TIMEOUT=180,
+# ASPIA_BIN_URL (where the archives are published), ASSET_FLAVOR (-upx: compressed binaries),
+# UPSTREAM_API (where the latest Aspia release is looked up).
+
+CONFIG_DIR=/etc/aspia
+DATA_DIR=/var/lib/aspia
+# Same choice as in aspia_start: a separate mount /var/lib/aspia-store or next to the database.
+if [[ -z "${STORE_DIR}" ]]; then
+    STORE_DIR=/var/lib/aspia-store
+    mountpoint -q "${STORE_DIR}" 2>/dev/null || STORE_DIR=${DATA_DIR}
+fi
+VERSIONS_DIR=${STORE_DIR}/versions
+BACKUP_DIR=${STORE_DIR}/backups
+RUN_DIR=/run/aspia
+LOG_FILE=/var/log/aspia/update.log
+LOCK_DIR=${RUN_DIR}/update.lock
+
+UPDATE_TIME=${UPDATE_TIME:-04:00}
+MIN_AGE_DAYS=${MIN_AGE_DAYS:-2}
+KEEP_BACKUPS=${KEEP_BACKUPS:-5}
+KEEP_VERSIONS=${KEEP_VERSIONS:-2}
+HEALTH_TIMEOUT=${HEALTH_TIMEOUT:-180}
+ASPIA_BIN_URL=${ASPIA_BIN_URL:-https://github.com/SinitsaDA/aspia-server-docker/releases/download}
+# ASSET_FLAVOR=-upx: the archives with UPX-compressed binaries (the MikroTik image)
+ASSET_FLAVOR=${ASSET_FLAVOR:-}
+UPSTREAM_API=${UPSTREAM_API:-https://api.github.com/repos/dchapyshev/aspia/releases}
+
+mkdir -p "$(dirname "${LOG_FILE}")" "${VERSIONS_DIR}" "${BACKUP_DIR}" "${RUN_DIR}"
+
+# the update log keeps only its last lines (it lives in flash on MikroTik)
+if [[ -f "${LOG_FILE}" ]] && (( $(wc -l < "${LOG_FILE}") > 400 )); then
+    tail -n 200 "${LOG_FILE}" > "${LOG_FILE}.tmp" && mv -f "${LOG_FILE}.tmp" "${LOG_FILE}"
+fi
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [update] $*" | tee -a "${LOG_FILE}"
+}
+
+case "$(uname -m)" in
+    x86_64)          ARCH=amd64 ;;
+    aarch64|arm64)   ARCH=arm64 ;;
+    armv7l|armv8l)   ARCH=armv7 ;;
+    *)               ARCH="$(uname -m)" ;;
+esac
+
+running_version() {
+    tr -d '[:space:]' < "${RUN_DIR}/version" 2>/dev/null
+}
+
+version_gt() {
+    [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" ]]
+}
+
+supervisor_signal() {
+    local pid
+    pid="$(cat "${RUN_DIR}/supervisor.pid" 2>/dev/null)"
+    [[ -n "${pid}" ]] && kill -USR1 "${pid}" 2>/dev/null
+}
+
+# pause: stops the services (aspia_start waits while the pause file exists)
+pause_services() {
+    touch "${RUN_DIR}/pause"
+    supervisor_signal
+    local _
+    for _ in $(seq 1 60); do
+        pgrep -x aspia_router >/dev/null 2>&1 || pgrep -x aspia_relay >/dev/null 2>&1 || return 0
+        sleep 1
+    done
+    log "WARNING: the services did not stop in 60 s"
+}
+
+resume_services() {
+    rm -f "${RUN_DIR}/pause"
+}
+
+wait_healthy() {
+    local deadline=$((SECONDS + HEALTH_TIMEOUT))
+    sleep 10
+    while (( SECONDS < deadline )); do
+        aspia_health >/dev/null 2>&1 && return 0
+        sleep 5
+    done
+    return 1
+}
+
+set_current() {
+    echo "$1" > "${VERSIONS_DIR}/current.tmp" && mv -f "${VERSIONS_DIR}/current.tmp" "${VERSIONS_DIR}/current"
+}
+
+# download <version>: puts the binaries into VERSIONS_DIR/<version>, returns 2 if not published
+download_version() {
+    local version="$1" name url tmp
+    name="aspia-server-${version}-linux-${ARCH}${ASSET_FLAVOR}.tar.gz"
+    url="${ASPIA_BIN_URL}/aspia-${version}/${name}"
+    tmp="${VERSIONS_DIR}/.download-${version}"
+
+    if [[ -x "${VERSIONS_DIR}/${version}/aspia_router" && -x "${VERSIONS_DIR}/${version}/aspia_relay" ]]; then
+        return 0
+    fi
+
+    rm -rf "${tmp}" && mkdir -p "${tmp}/bin"
+    # The checksum is published together with the archive: no checksum - not published yet.
+    if ! curl -fsSL --max-time 60 -o "${tmp}/${name}.sha256" "${url}.sha256"; then
+        rm -rf "${tmp}"
+        return 2
+    fi
+    local expected actual status _
+    expected="$(cut -d' ' -f1 < "${tmp}/${name}.sha256")"
+
+    # The archive is unpacked while it is downloaded (small devices have no space for both),
+    # its checksum is computed on the way and checked before the binaries are used.
+    curl -fsSL --max-time 900 "${url}" | tee >(sha256sum | cut -d' ' -f1 > "${tmp}/actual") |
+        tar -xzf - -C "${tmp}/bin"
+    status="${PIPESTATUS[0]}${PIPESTATUS[2]}"
+    for _ in $(seq 1 30); do
+        [[ -s "${tmp}/actual" ]] && break
+        sleep 1
+    done
+    actual="$(cat "${tmp}/actual" 2>/dev/null)"
+    if [[ "${status}" != "00" ]]; then
+        log "ERROR: download of ${name} failed"
+        rm -rf "${tmp}"
+        return 1
+    fi
+    if [[ -z "${expected}" || "${actual}" != "${expected}" ]]; then
+        log "ERROR: checksum mismatch for ${name}"
+        rm -rf "${tmp}"
+        return 1
+    fi
+
+    chmod 755 "${tmp}/bin/aspia_router" "${tmp}/bin/aspia_relay" 2>/dev/null
+
+    # The binaries must run on this CPU and report the expected version.
+    local reported
+    reported="$("${tmp}/bin/aspia_router" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
+    if [[ "${reported}" != "${version}" ]]; then
+        log "ERROR: downloaded aspia_router reports version '${reported}', expected ${version}"
+        rm -rf "${tmp}"
+        return 1
+    fi
+
+    rm -rf "${VERSIONS_DIR:?}/${version}"
+    mv "${tmp}/bin" "${VERSIONS_DIR}/${version}"
+    rm -rf "${tmp}"
+    return 0
+}
+
+# restore_download <version>: with KEEP_VERSIONS=1 the running version was removed before the
+# download; get it back, otherwise the next start would fall back to the older version of the image.
+restore_download() {
+    local version="$1"
+    (( KEEP_VERSIONS < 2 )) || return 0
+    [[ "${version}" == "${ASPIA_VERSION}" || -x "${VERSIONS_DIR}/${version}/aspia_router" ]] && return 0
+    log "Downloading the running Aspia ${version} again"
+    download_version "${version}" || log "ERROR: unable to download ${version} again"
+}
+
+# install <version>
+install_version() {
+    local target="$1" current backup
+    current="$(running_version)"
+
+    # Little space (KEEP_VERSIONS=1, e.g. MikroTik flash): only one downloaded version is kept,
+    # the previous one is downloaded again if a rollback is needed.
+    if (( KEEP_VERSIONS < 2 )); then
+        cleanup_versions "${target}" ""
+    fi
+
+    log "Downloading Aspia ${target} for linux-${ARCH}"
+    download_version "${target}"
+    case $? in
+        0) ;;
+        2) log "Binaries of ${target} for linux-${ARCH} are not published yet, will try later"
+           restore_download "${current}"; return 2 ;;
+        *) log "ERROR: download of ${target} failed, staying on ${current}"
+           restore_download "${current}"; return 1 ;;
+    esac
+
+    log "Updating Aspia ${current} -> ${target}"
+    pause_services
+
+    backup="${BACKUP_DIR}/aspia_${current}_$(date +%Y-%m-%d_%H-%M-%S).tar.gz"
+    # (the exclusions must precede the paths for GNU tar)
+    if ! tar -czf "${backup}" --exclude=var/lib/aspia/versions --exclude=var/lib/aspia/backups             -C / etc/aspia var/lib/aspia; then
+        log "ERROR: backup failed, starting ${current} again"
+        rm -f "${backup}"
+        resume_services
+        return 1
+    fi
+    log "Backup: ${backup} ($(du -h "${backup}" | cut -f1))"
+    ls -1t "${BACKUP_DIR}"/aspia_*.tar.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -f
+
+    local previous_current=""
+    [[ -f "${VERSIONS_DIR}/current" ]] && previous_current="$(cat "${VERSIONS_DIR}/current")"
+    set_current "${target}"
+    resume_services
+
+    if wait_healthy && [[ "$(running_version)" == "${target}" ]]; then
+        log "Aspia ${target} is running and healthy"
+        if (( KEEP_VERSIONS < 2 )); then
+            cleanup_versions "${target}" ""
+        else
+            cleanup_versions "${target}" "${current}"
+        fi
+        return 0
+    fi
+
+    log "ERROR: Aspia ${target} is not healthy after ${HEALTH_TIMEOUT}s, rolling back to ${current}"
+    pause_services
+    find "${CONFIG_DIR}" -mindepth 1 -delete
+    find "${DATA_DIR}" -mindepth 1 -maxdepth 1 ! -name versions ! -name backups -exec rm -rf {} +
+    tar -xzf "${backup}" -C / || log "ERROR: unable to restore ${backup}, restore it manually"
+    if (( KEEP_VERSIONS < 2 )); then
+        rm -rf "${VERSIONS_DIR:?}/${target}"
+    fi
+    if [[ -n "${previous_current}" && ! -x "${VERSIONS_DIR}/${previous_current}/aspia_router" ]] &&
+       [[ "${previous_current}" != "${ASPIA_VERSION}" ]]; then
+        log "Downloading Aspia ${previous_current} again for the rollback"
+        download_version "${previous_current}" ||
+            log "ERROR: unable to download ${previous_current}, starting the version of the image (${ASPIA_VERSION})"
+    fi
+    if [[ -n "${previous_current}" && -x "${VERSIONS_DIR}/${previous_current}/aspia_router" ]]; then
+        set_current "${previous_current}"
+    else
+        rm -f "${VERSIONS_DIR}/current"
+    fi
+    resume_services
+
+    if wait_healthy; then
+        log "Rolled back to ${current}"
+    else
+        log "ERROR: rolled back to ${current}, but it is not healthy either - check the server"
+    fi
+    return 1
+}
+
+cleanup_versions() {
+    local keep1="$1" keep2="$2" dir
+    for dir in "${VERSIONS_DIR}"/*/; do
+        [[ -d "${dir}" ]] || continue
+        dir="$(basename "${dir}")"
+        [[ "${dir}" == "${keep1}" || "${dir}" == "${keep2}" ]] && continue
+        rm -rf "${VERSIONS_DIR:?}/${dir}" && log "Removed old version ${dir}"
+    done
+}
+
+# check [min_age_days] [forced_version]
+check() {
+    local min_age="$1" target="$2" current release published age
+    current="$(running_version)"
+    [[ -n "${current}" ]] || { log "ERROR: the server is not running yet"; return 1; }
+
+    if [[ -z "${target}" ]]; then
+        release="$(curl -fsSL --max-time 30 "${UPSTREAM_API}/latest")" ||
+            { log "ERROR: unable to get the latest Aspia release"; return 1; }
+        target="$(echo "${release}" | jq -r '.tag_name // empty' | sed 's/^v//')"
+        published="$(echo "${release}" | jq -r '.published_at // empty')"
+        [[ -n "${target}" ]] || { log "ERROR: unable to parse the latest release"; return 1; }
+
+        if ! version_gt "${target}" "${current}"; then
+            log "Aspia ${current} is up to date"
+            return 0
+        fi
+        if drops_legacy_hosts "${current}" "${target}"; then
+            log "Aspia ${target} is available, but 3.1+ has no support for 2.x hosts - not installed" \
+                "automatically. To install it anyway: aspia_update --version ${target}"
+            return 0
+        fi
+        age=$(( ($(date +%s) - $(date -d "${published}" +%s)) / 86400 ))
+        if (( age < min_age )); then
+            log "Aspia ${target} is ${age} day(s) old, it will be installed when it is ${min_age} day(s) old"
+            return 0
+        fi
+    elif [[ "${target}" == "${current}" ]]; then
+        log "Aspia ${current} is already running"
+        return 0
+    fi
+
+    if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+        log "Another update is running"
+        return 1
+    fi
+    install_version "${target}"
+    local rc=$?
+    rmdir "${LOCK_DIR}" 2>/dev/null
+    return ${rc}
+}
+
+# Aspia 3.1.0 removed the 2.x hosts protocol and the 2.x data migration (3.0.37 is the last with them).
+drops_legacy_hosts() {
+    [[ "$1" == 2.* || "$1" == 3.0.* ]] && ! [[ "$2" == 2.* || "$2" == 3.0.* ]]
+}
+
+# interactive check: shows the versions and asks before installing
+ask_check() {
+    local current release target published code answer
+    current="$(running_version)"
+    [[ -n "${current}" ]] || { echo "The server is not running yet"; return 1; }
+
+    release="$(curl -fsSL --max-time 30 "${UPSTREAM_API}/latest")" ||
+        { echo "Unable to get the latest Aspia release (no internet access?)"; return 1; }
+    target="$(echo "${release}" | jq -r '.tag_name // empty' | sed 's/^v//')"
+    published="$(echo "${release}" | jq -r '.published_at // empty')"
+    [[ -n "${target}" ]] || { echo "Unable to parse the latest release"; return 1; }
+
+    echo "Installed: Aspia ${current} (linux-${ARCH})"
+    echo "Latest:    Aspia ${target} (published $(date -d "${published}" '+%Y-%m-%d'))"
+    if ! version_gt "${target}" "${current}"; then
+        echo "Aspia ${current} is up to date"
+        return 0
+    fi
+
+    code="$(curl -sL -o /dev/null -w '%{http_code}' --max-time 30 \
+        "${ASPIA_BIN_URL}/aspia-${target}/aspia-server-${target}-linux-${ARCH}${ASSET_FLAVOR}.tar.gz.sha256")"
+    if [[ "${code}" != "200" ]]; then
+        echo "The binaries of ${target} for linux-${ARCH} are not published yet, try again later"
+        return 0
+    fi
+
+    if drops_legacy_hosts "${current}" "${target}"; then
+        echo
+        echo "WARNING: Aspia 3.1+ has no support for 2.x hosts and no 2.x data migration."
+        echo "         After the update 2.x hosts will not connect. Update them to 3.x first."
+        echo
+    fi
+
+    if [[ ! -t 0 ]]; then
+        echo "To install it: aspia_update --version ${target}"
+        return 0
+    fi
+    read -r -p "Update Aspia ${current} -> ${target}? [y/N] " answer
+    if [[ ! "${answer}" =~ ^([yY]|[yY][eE][sS])$ ]]; then
+        echo "Cancelled"
+        return 0
+    fi
+    check 0 "${target}"
+}
+
+next_run() {
+    local now next
+    now=$(date +%s)
+    next=$(date -d "today ${UPDATE_TIME}" +%s) || { log "Invalid UPDATE_TIME: ${UPDATE_TIME}"; exit 1; }
+    (( next <= now )) && next=$(date -d "tomorrow ${UPDATE_TIME}" +%s)
+    echo "${next}"
+}
+
+case "$1" in
+    --daemon)
+        rmdir "${LOCK_DIR}" 2>/dev/null
+        trap 'exit 0' SIGTERM SIGINT
+        sleep 120 & wait $!          # let the server start first
+        while true; do
+            check "${MIN_AGE_DAYS}"
+            [[ $? -eq 2 ]] && next=$(( $(date +%s) + 3600 )) || next=$(next_run)
+            log "Next check: $(date -d "@${next}" '+%Y-%m-%d %H:%M %Z')"
+            sleep $(( next - $(date +%s) )) & wait $!
+        done
+        ;;
+    --now)
+        check 0
+        ;;
+    --version)
+        [[ -n "$2" ]] || { echo "Usage: aspia_update --version <x.y.z>"; exit 1; }
+        check 0 "${2#v}"
+        ;;
+    --status)
+        echo "Running: $(running_version) (linux-${ARCH})"
+        echo "Store: ${STORE_DIR} (downloaded versions and backups)"
+        echo "Selected: $(cat "${VERSIONS_DIR}/current" 2>/dev/null || echo "image")"
+        echo "Installed: $(find "${VERSIONS_DIR}" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -printf '%f ' 2>/dev/null)"
+        echo "Backups:"; ls -1t "${BACKUP_DIR}" 2>/dev/null | head -n 5
+        echo "Log:"; tail -n 10 "${LOG_FILE}" 2>/dev/null || true
+        ;;
+    ""|--check)
+        ask_check
+        ;;
+    *)
+        sed -n '4,10p' "$0"
+        exit 1
+        ;;
+esac
