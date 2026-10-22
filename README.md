@@ -32,6 +32,7 @@ ghcr.io/sinitsada/aspia-server:latest
 - [Установка](#установка)
   - [Способ 1. Docker Compose с автообновлением (рекомендуется)](#способ-1-docker-compose-с-автообновлением-рекомендуется)
   - [Способ 2. Synology NAS](docs/synology.md)
+  - [ARM и MikroTik (контейнер на роутере)](docs/mikrotik-container.md)
   - [Способ 3. Просто Docker (docker run, Portainer)](#способ-3-просто-docker-docker-run-portainer)
 - [Первый вход и ключ для хостов](#первый-вход-и-ключ-для-хостов)
 - [Порты и проброс на роутере](#порты-и-проброс-на-роутере)
@@ -45,7 +46,7 @@ ghcr.io/sinitsada/aspia-server:latest
 
 ## Что нужно
 
-- Сервер или ВМ с Linux на **x86_64** (Intel/AMD). Aspia выпускает серверные пакеты только под эту архитектуру: на ARM (Raspberry Pi, часть NAS) образ не запустится.
+- Сервер или ВМ с Linux на **x86_64** (Intel/AMD). Aspia выпускает серверные пакеты только под эту архитектуру: на ARM (Raspberry Pi, часть NAS) образ не запустится. Для ARM есть отдельные образы, в том числе для контейнера прямо на роутере MikroTik: [docs/mikrotik-container.md](docs/mikrotik-container.md).
 - Docker 24 или новее.
 - Внешний («белый») IP-адрес или проброс портов на этот сервер, см. [Порты](#порты-и-проброс-на-роутере).
 - Около 1 ГБ свободного места.
@@ -56,6 +57,7 @@ ghcr.io/sinitsada/aspia-server:latest
 |---|---|---|
 | [1. Docker Compose с автообновлением](#способ-1-docker-compose-с-автообновлением-рекомендуется) | Linux-сервер или ВМ | автоматически, с бэкапом и откатом |
 | [2. Synology NAS](docs/synology.md) | Synology с Container Manager | автоматически, с бэкапом и откатом |
+| [ARM и MikroTik](docs/mikrotik-container.md) | Raspberry Pi, ARM-NAS, контейнер на роутере MikroTik | автоматически внутри контейнера, с бэкапом и откатом |
 | [3. Просто Docker](#способ-3-просто-docker-docker-run-portainer) | любая ВМ, Portainer, Unraid, TrueNAS и т.п. | вручную одной командой или через Watchtower |
 
 ### Способ 1. Docker Compose с автообновлением (рекомендуется)
@@ -253,6 +255,14 @@ docker run -d --name watchtower --restart unless-stopped \
 **Хотите остаться на определённой версии?** Укажите точный тег вместо `latest`, например `ghcr.io/sinitsada/aspia-server:3.0.18`.
 
 ## Переход с Aspia 2.x
+
+> **Внимание: в Aspia 3.1 разработчик убрал поддержку хостов 2.x (порт 8060) и перенос данных 2.x.**
+> Всё, что написано ниже, работает только в версиях **3.0.x**. Если у вас остались хосты 2.x или нужно
+> перенести данные 2.x, используйте последнюю версию 3.0 — **3.0.37** — и не давайте ей обновиться до 3.1:
+> способ 1 и Synology — `ASPIA_VERSION=3.0.37` в `.env` и остановленный обновлятель
+> (`docker compose stop updater`, на Synology — контейнер `aspia-updater`);
+> способ 3 — тег `ghcr.io/sinitsada/aspia-server:3.0.37` вместо `latest` и без Watchtower.
+> Данные, перенесённые в 3.0.37, затем без проблем обновляются до 3.1.
 
 Сервер 3.x сам конвертирует данные 2.x при первом запуске:
 - `router.json` → `router.conf`, `relay.json` → `relay.conf`, старые файлы сохраняются как `*.json.bak`;

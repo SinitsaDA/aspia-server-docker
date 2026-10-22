@@ -28,7 +28,7 @@ ghcr.io/sinitsada/aspia-server:latest
 
 ## Requirements
 
-- **x86_64** (Intel/AMD) Linux server or VM. Aspia ships its server packages for this architecture only.
+- **x86_64** (Intel/AMD) Linux server or VM. Aspia ships its server packages for this architecture only. For ARM there are separate images, including a container right on a MikroTik router: [docs/mikrotik-container.en.md](docs/mikrotik-container.en.md).
 - Docker 24 or later.
 - A public IP address or port forwarding to this server.
 - About 1 GB of disk space.
@@ -39,6 +39,7 @@ ghcr.io/sinitsada/aspia-server:latest
 |---|---|---|
 | [1. Docker Compose with automatic updates](#method-1-docker-compose-with-automatic-updates-recommended) | Linux server or VM | automatic, with backup and rollback |
 | [2. Synology NAS](docs/synology.md) (in Russian) | Synology Container Manager | automatic, with backup and rollback |
+| [ARM and MikroTik](docs/mikrotik-container.en.md) | Raspberry Pi, ARM NAS, a container on a MikroTik router | automatic inside the container, with backup and rollback |
 | [3. Plain Docker](#method-3-plain-docker-docker-run-portainer) | any VM, Portainer, Unraid, TrueNAS... | one command, or Watchtower |
 
 ### Method 1. Docker Compose with automatic updates (recommended)
@@ -171,6 +172,14 @@ docker run -d --name watchtower --restart unless-stopped \
 To stay on a specific version, use an exact tag such as `ghcr.io/sinitsada/aspia-server:3.0.18` instead of `latest`.
 
 ## Migrating from Aspia 2.x
+
+> **Note: Aspia 3.1 removed the 2.x hosts support (port 8060) and the 2.x data migration.**
+> Everything below works in the **3.0.x** versions only. If you still have 2.x hosts or 2.x data to move,
+> use the last 3.0 — **3.0.37** — and do not let it update to 3.1:
+> method 1 and Synology — `ASPIA_VERSION=3.0.37` in `.env` and the updater stopped
+> (`docker compose stop updater`, on Synology the container `aspia-updater`);
+> method 3 — the tag `ghcr.io/sinitsada/aspia-server:3.0.37` instead of `latest` and no Watchtower.
+> Data moved into 3.0.37 updates to 3.1 without problems afterwards.
 
 On the first start, the 3.x server converts 2.x data by itself:
 - `router.json` and `relay.json` become `*.conf`, the old files are kept as `*.json.bak`;
