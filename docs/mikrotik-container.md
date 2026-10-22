@@ -256,3 +256,7 @@ aspia_update --check
 /interface/veth/remove [find name=veth-aspia]
 ```
 Папку `aspia` (настройки и база) удалите в Winbox → Files, если она больше не нужна.
+
+## Вопросы и отзывы
+
+Вопросы, отзывы и «работает на моей модели» — в [Discussions](https://github.com/SinitsaDA/aspia-server-docker/discussions), ошибки — в [Issues](https://github.com/SinitsaDA/aspia-server-docker/issues).

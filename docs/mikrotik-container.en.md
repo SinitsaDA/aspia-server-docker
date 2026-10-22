@@ -256,3 +256,7 @@ Manual copy: Winbox → Files, folders `aspia/etc` and `aspia/data`.
 /interface/veth/remove [find name=veth-aspia]
 ```
 Delete the folder `aspia` (settings and database) in Winbox → Files if it is no longer needed.
+
+## Questions and feedback
+
+Questions, feedback and "works on my model" — in [Discussions](https://github.com/SinitsaDA/aspia-server-docker/discussions), bugs — in [Issues](https://github.com/SinitsaDA/aspia-server-docker/issues).
