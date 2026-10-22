@@ -39,10 +39,10 @@ ENV PATH=/usr/local/bin:/usr/bin:/bin \
     ASSET_FLAVOR=-upx \
     KEEP_VERSIONS=1
 
-COPY bin-upx/${TARGETARCH}${TARGETVARIANT}/aspia_router bin-upx/${TARGETARCH}${TARGETVARIANT}/aspia_relay /opt/aspia/${ASPIA_VERSION}/
-COPY aspia_start aspia_health aspia_update /usr/bin/
-COPY aspia_router.wrapper /usr/local/bin/aspia_router
-COPY aspia_relay.wrapper /usr/local/bin/aspia_relay
+COPY --chmod=755 bin-upx/${TARGETARCH}${TARGETVARIANT}/aspia_router bin-upx/${TARGETARCH}${TARGETVARIANT}/aspia_relay /opt/aspia/${ASPIA_VERSION}/
+COPY --chmod=755 aspia_start aspia_health aspia_update /usr/bin/
+COPY --chmod=755 aspia_router.wrapper /usr/local/bin/aspia_router
+COPY --chmod=755 aspia_relay.wrapper /usr/local/bin/aspia_relay
 
 # 8060 hosts 2.x | 8061 hosts 3.x | 8062 clients | 8063 relay <-> router | 8065/udp STUN | 8070 relay peers
 EXPOSE 8060 8061 8062 8063 8065/udp 8070
