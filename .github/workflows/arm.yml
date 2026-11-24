@@ -186,7 +186,8 @@ jobs:
           grep -h -A 25 "CMake Error" work/cmake-configure-*-"${ARCH}".log 2>/dev/null | head -n 80 | annotate "configure"
           grep -h -B 2 -A 10 -E "error:|FAILED:" work/cmake-build-*-"${ARCH}".log 2>/dev/null | head -n 120 |
             annotate "compiler"
-          find work/aspia-*/vcpkg4aspia/buildtrees -name '*-err.log' -size +0 2>/dev/null | head -n 3 |
+          find work/aspia-*/vcpkg4aspia/buildtrees -name '*-err.log' -size +0 -exec grep -l -E "error|fatal" {} + 2>/dev/null |
+            grep -v -E "detect_compiler|get-vars" | head -n 3 |
             while read -r log; do tail -n 40 "${log}" | annotate "$(basename "${log}")"; done
           for log in work/vcpkg-install-*-"${ARCH}".log work/cmake-configure-*-"${ARCH}".log; do
             [[ -f "${log}" ]] || continue

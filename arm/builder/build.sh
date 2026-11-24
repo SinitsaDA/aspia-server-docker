@@ -39,6 +39,10 @@ export CMAKE_BUILD_PARALLEL_LEVEL="${JOBS}"
 export VCPKG_ROOT="${SRC}/vcpkg4aspia"
 export VCPKG_INSTALLED_DIR="${BUILD}/vcpkg_installed"
 mkdir -p "${VCPKG_DEFAULT_BINARY_CACHE}" "${VCPKG_DOWNLOADS}" "${OUT}"
+# /work belongs to the user of the CI runner (the cache is restored by it), the build runs as root:
+# git refuses such repositories ("dubious ownership"), and vcpkg fetches some ports with git
+# (libyuv) into /work/vcpkg-downloads/git-tmp.
+git config --global --add safe.directory '*'
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
