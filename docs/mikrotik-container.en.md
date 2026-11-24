@@ -7,7 +7,7 @@ Tested on **L009UiGS** (RouterOS 7.24, 32-bit ARM, 512 MB RAM, 128 MB flash): th
 built-in flash without USB storage, uses ~100–150 MB of RAM and almost no CPU.
 
 > The developer of Aspia releases server packages for x86_64 only. The ARM builds are made by this
-> project: armv7 is built from the sources, arm64 is taken from the developer's CI. These builds are unofficial.
+> project: armv7 and arm64 are built here from the sources. These builds are unofficial.
 
 ## Images
 

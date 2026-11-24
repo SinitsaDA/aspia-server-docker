@@ -1,26 +1,35 @@
 #!/bin/bash
 #
-# Builds aspia_router and aspia_relay for 32-bit ARM (armv7, vcpkg triplet arm-linux) inside the
-# builder image and packs them into the release archives:
-#   out/aspia-server-<version>-linux-armv7.tar.gz       plain binaries
-#   out/aspia-server-<version>-linux-armv7-upx.tar.gz   UPX-compressed binaries (MikroTik image)
-# with a .sha256 file next to each.
+# Builds aspia_router and aspia_relay for ARM inside the builder image (cross compilation on x86_64)
+# and packs them into the release archives:
+#   out/aspia-server-<version>-linux-<arch>.tar.gz       plain binaries
+#   out/aspia-server-<version>-linux-<arch>-upx.tar.gz   UPX-compressed binaries (MikroTik image)
+# with a .sha256 file next to each. <arch>: armv7 (32-bit, vcpkg triplet arm-linux) or arm64
+# (64-bit, triplet arm64-linux).
 #
-#   docker build -t aspia-armv7-builder arm/builder
-#   docker run --rm -v "$PWD/work:/work" -v "$PWD/arm/builder:/scripts:ro" aspia-armv7-builder \
-#       bash /scripts/build.sh 3.1.2
+#   docker build -t aspia-arm-builder arm/builder
+#   docker run --rm -v "$PWD/work:/work" -v "$PWD/arm/builder:/scripts:ro" aspia-arm-builder \
+#       bash /scripts/build.sh 3.4.3 armv7
 #
 # /work keeps the sources, the vcpkg binary cache and the downloads: a second run continues where
-# the previous one stopped. The developer of Aspia does not build for armv7, so a few things are
-# adjusted in the local copy of the sources (see below).
+# the previous one stopped (the sources are shared by both architectures, the dependencies are not).
+# The developer of Aspia publishes no Router/Relay for ARM, so a few things are adjusted in the local
+# copy of the sources (see below).
 
 set -euo pipefail
 
-VERSION="${1:?usage: build.sh <aspia version>}"
+VERSION="${1:?usage: build.sh <aspia version> [armv7|arm64]}"
+ARCH="${2:-armv7}"
+case "${ARCH}" in
+    armv7) TRIPLET=arm-linux;   CROSS=arm-linux-gnueabihf; PROCESSOR=armv7l ;;
+    arm64) TRIPLET=arm64-linux; CROSS=aarch64-linux-gnu;   PROCESSOR=aarch64 ;;
+    *) echo "Unknown architecture: ${ARCH} (armv7 or arm64)" >&2; exit 1 ;;
+esac
 JOBS="${JOBS:-$(nproc)}"
 SRC=/work/aspia-${VERSION}
 OUT=/work/out
 TRIPLETS="$(cd "$(dirname "$0")" && pwd)/triplets"
+BUILD="${SRC}/builds/${ARCH}"
 
 export VCPKG_DEFAULT_BINARY_CACHE=/work/vcpkg-cache
 export VCPKG_DOWNLOADS=/work/vcpkg-downloads
@@ -28,7 +37,7 @@ export VCPKG_MAX_CONCURRENCY="${JOBS}"
 export CMAKE_BUILD_PARALLEL_LEVEL="${JOBS}"
 # CMakeLists.txt of Aspia takes the vcpkg paths from the environment (used by qtprotoc_host)
 export VCPKG_ROOT="${SRC}/vcpkg4aspia"
-export VCPKG_INSTALLED_DIR="${SRC}/builds/armv7/vcpkg_installed"
+export VCPKG_INSTALLED_DIR="${BUILD}/vcpkg_installed"
 mkdir -p "${VCPKG_DEFAULT_BINARY_CACHE}" "${VCPKG_DOWNLOADS}" "${OUT}"
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -54,41 +63,41 @@ if [[ ! -x vcpkg4aspia/vcpkg ]]; then
     ./vcpkg4aspia/bootstrap-vcpkg.sh -disableMetrics
 fi
 
-# ---------- Dependencies (vcpkg, arm-linux, static) ----------
-log "Installing the vcpkg dependencies for arm-linux (the longest part)"
+# ---------- Dependencies (vcpkg, static) ----------
+log "Installing the vcpkg dependencies for ${TRIPLET} (the longest part)"
 if ! ./vcpkg4aspia/vcpkg install \
-        --triplet arm-linux --host-triplet x64-linux \
+        --triplet "${TRIPLET}" --host-triplet x64-linux \
         --x-install-root="${VCPKG_INSTALLED_DIR}" \
         --overlay-triplets="${TRIPLETS}" \
         --clean-after-build \
-        > >(tee "/work/vcpkg-install-${VERSION}.log" | grep --line-buffered -E "^(Installing|Elapsed)|error|failed") 2>&1; then
-    log "ERROR: vcpkg install failed, see /work/vcpkg-install-${VERSION}.log"
+        > >(tee "/work/vcpkg-install-${VERSION}-${ARCH}.log" | grep --line-buffered -E "^(Installing|Elapsed)|error|failed") 2>&1; then
+    log "ERROR: vcpkg install failed, see /work/vcpkg-install-${VERSION}-${ARCH}.log"
     exit 1
 fi
 
 # ---------- Router and Relay ----------
-log "Configuring Aspia"
-if ! cmake -S . -B builds/armv7/Release -G Ninja \
+log "Configuring Aspia (${ARCH})"
+if ! cmake -S . -B "${BUILD}/Release" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=armv7l \
-        -DCMAKE_C_COMPILER=arm-linux-gnueabihf-gcc -DCMAKE_CXX_COMPILER=arm-linux-gnueabihf-g++ \
+        -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR="${PROCESSOR}" \
+        -DCMAKE_C_COMPILER="${CROSS}-gcc" -DCMAKE_CXX_COMPILER="${CROSS}-g++" \
         -DQT_HOST_PATH="${VCPKG_INSTALLED_DIR}/x64-linux" \
         -DQT_HOST_PATH_CMAKE_DIR="${VCPKG_INSTALLED_DIR}/x64-linux/share" \
         -DCMAKE_TOOLCHAIN_FILE="${SRC}/vcpkg4aspia/scripts/buildsystems/vcpkg.cmake" \
-        -DVCPKG_TARGET_TRIPLET=arm-linux -DVCPKG_HOST_TRIPLET=x64-linux \
+        -DVCPKG_TARGET_TRIPLET="${TRIPLET}" -DVCPKG_HOST_TRIPLET=x64-linux \
         -DVCPKG_INSTALLED_DIR="${VCPKG_INSTALLED_DIR}" \
         -DVCPKG_MANIFEST_INSTALL=OFF \
         -DVCPKG_OVERLAY_TRIPLETS="${TRIPLETS}" \
-        > "/work/cmake-configure-${VERSION}.log" 2>&1; then
-    tail -40 "/work/cmake-configure-${VERSION}.log"
-    log "ERROR: configuration failed, see /work/cmake-configure-${VERSION}.log"
+        > "/work/cmake-configure-${VERSION}-${ARCH}.log" 2>&1; then
+    tail -40 "/work/cmake-configure-${VERSION}-${ARCH}.log"
+    log "ERROR: configuration failed, see /work/cmake-configure-${VERSION}-${ARCH}.log"
     exit 1
 fi
 
-log "Building aspia_router and aspia_relay"
-if ! cmake --build builds/armv7/Release --target aspia_router aspia_relay \
-        > >(tee "/work/cmake-build-${VERSION}.log" | grep --line-buffered -E "error|FAILED|Linking") 2>&1; then
-    log "ERROR: build failed, see /work/cmake-build-${VERSION}.log"
+log "Building aspia_router and aspia_relay (${ARCH})"
+if ! cmake --build "${BUILD}/Release" --target aspia_router aspia_relay \
+        > >(tee "/work/cmake-build-${VERSION}-${ARCH}.log" | grep --line-buffered -E "error|FAILED|Linking") 2>&1; then
+    log "ERROR: build failed, see /work/cmake-build-${VERSION}-${ARCH}.log"
     exit 1
 fi
 
@@ -100,16 +109,17 @@ pack() {
 }
 
 plain="$(mktemp -d)"
-find builds/armv7/Release -type f \( -name aspia_router -o -name aspia_relay \) -exec cp {} "${plain}/" \;
-arm-linux-gnueabihf-strip "${plain}/aspia_router" "${plain}/aspia_relay"
+find "${BUILD}/Release" -type f \( -name aspia_router -o -name aspia_relay \) -exec cp {} "${plain}/" \;
+"${CROSS}-strip" "${plain}/aspia_router" "${plain}/aspia_relay"
 file "${plain}"/*
-pack "${plain}" "aspia-server-${VERSION}-linux-armv7.tar.gz"
+file "${plain}/aspia_router" | grep -q "$([[ "${ARCH}" == arm64 ]] && echo aarch64 || echo 'ARM,')"
+pack "${plain}" "aspia-server-${VERSION}-linux-${ARCH}.tar.gz"
 
 log "Compressing the binaries with UPX"
 upx_dir="$(mktemp -d)"
 cp "${plain}"/aspia_* "${upx_dir}/"
 upx --best --lzma -q "${upx_dir}/aspia_router" "${upx_dir}/aspia_relay"
-pack "${upx_dir}" "aspia-server-${VERSION}-linux-armv7-upx.tar.gz"
+pack "${upx_dir}" "aspia-server-${VERSION}-linux-${ARCH}-upx.tar.gz"
 
 rm -rf "${plain}" "${upx_dir}"
 ls -la "${OUT}"

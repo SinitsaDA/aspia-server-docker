@@ -1,8 +1,8 @@
 name: ARM images
 
-# Aspia Router + Relay for ARM:
-#  - armv7: built here from the sources (the developer of Aspia does not build for armv7);
-#  - arm64: taken from the CI artifacts of the Aspia repository (kept there for 7 days);
+# Aspia Router + Relay for ARM, both built here from the sources (the developer of Aspia publishes
+# no Router/Relay for ARM; his arm64 CI builds are kept for 7 days only):
+#  - armv7 (32-bit) and arm64 (64-bit), cross compiled on x86_64, each with its own vcpkg cache;
 #  - release "aspia-<version>": archives for the self-update inside the container
 #    (aspia-server-<version>-linux-<arch>[-upx].tar.gz + .sha256);
 #  - images: ghcr.io/<owner>/aspia-server-arm (armv7 + arm64), ghcr.io/<owner>/aspia-server-mikrotik
@@ -48,8 +48,7 @@ jobs:
       latest: ${{ steps.version.outputs.latest }}
       minor_latest: ${{ steps.version.outputs.minor_latest }}
       legacy: ${{ steps.version.outputs.legacy }}
-      build_armv7: ${{ steps.decide.outputs.build_armv7 }}
-      get_arm64: ${{ steps.decide.outputs.get_arm64 }}
+      arches: ${{ steps.decide.outputs.arches }}
       build_images: ${{ steps.decide.outputs.build_images }}
     steps:
       - name: Aspia version
@@ -97,35 +96,39 @@ jobs:
           has() { grep -qxF "$1" <<<"${assets}"; }
           name="aspia-server-${VERSION}-linux"
 
-          build_armv7=true
-          has "${name}-armv7.tar.gz.sha256" && has "${name}-armv7-upx.tar.gz.sha256" && build_armv7=false
-          [[ "${FORCE}" == "true" ]] && build_armv7=true
-
-          # arm64 comes from the CI artifacts of Aspia, they are kept for 7 days after the release
-          get_arm64=true
-          has "${name}-arm64.tar.gz.sha256" && has "${name}-arm64-upx.tar.gz.sha256" && get_arm64=false
-          published="$(gh api "repos/${UPSTREAM}/releases/tags/v${VERSION}" -q .published_at)"
-          (( $(date +%s) - $(date -d "${published}" +%s) > 7 * 86400 )) && get_arm64=false
+          # Architectures without both archives (plain + UPX) in the release are built
+          arches=()
+          for arch in armv7 arm64; do
+            if [[ "${FORCE}" == "true" ]] ||
+               ! { has "${name}-${arch}.tar.gz.sha256" && has "${name}-${arch}-upx.tar.gz.sha256"; }; then
+              arches+=("${arch}")
+            fi
+          done
+          arches_json="$(printf '%s\n' "${arches[@]}" | jq -R . | jq -sc 'map(select(. != ""))')"
 
           owner="${GITHUB_REPOSITORY_OWNER,,}"
           build_images=true
-          if [[ "${EVENT}" == "schedule" && "${build_armv7}" == "false" ]] &&
+          if [[ "${EVENT}" == "schedule" && "${arches_json}" == "[]" ]] &&
              docker manifest inspect "ghcr.io/${owner}/aspia-server-mikrotik:${VERSION}" >/dev/null 2>&1; then
             build_images=false
           fi
           {
-            echo "build_armv7=${build_armv7}"
-            echo "get_arm64=${get_arm64}"
+            echo "arches=${arches_json}"
             echo "build_images=${build_images}"
           } >> "$GITHUB_OUTPUT"
-          echo "armv7: ${build_armv7}, arm64: ${get_arm64}, images: ${build_images}"
+          echo "build: ${arches_json}, images: ${build_images}"
 
-  armv7:
+  build:
     needs: prepare
-    if: needs.prepare.outputs.build_armv7 == 'true'
+    if: needs.prepare.outputs.arches != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 345
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(needs.prepare.outputs.arches) }}
     env:
+      ARCH: ${{ matrix.arch }}
       VERSION: ${{ needs.prepare.outputs.version }}
       TAG: ${{ needs.prepare.outputs.tag }}
       GH_TOKEN: ${{ github.token }}
@@ -141,8 +144,10 @@ jobs:
       - name: QEMU
         uses: docker/setup-qemu-action@v4
         with:
-          platforms: arm
+          platforms: arm,arm64
 
+      # vcpkg checks the ABI of every package itself, so an older cache of the same architecture is
+      # always safe to start from.
       - name: Restore the vcpkg cache
         id: cache
         uses: actions/cache/restore@v6
@@ -150,34 +155,63 @@ jobs:
           path: |
             work/vcpkg-cache
             work/vcpkg-downloads
-          key: armv7-vcpkg-${{ hashFiles('arm/builder/Dockerfile', 'arm/builder/triplets/**') }}-${{ github.run_id }}
+          key: ${{ matrix.arch }}-vcpkg-${{ hashFiles('arm/builder/Dockerfile', 'arm/builder/triplets/**') }}-${{ github.run_id }}
           restore-keys: |
-            armv7-vcpkg-${{ hashFiles('arm/builder/Dockerfile', 'arm/builder/triplets/**') }}-
-            armv7-vcpkg-
-
-      # One-time seed of the cache (a draft release, readable only by the owner) - saves hours on the
-      # first run; the draft is removed once the cache exists.
-      - name: Seed the vcpkg cache
-        if: steps.cache.outputs.cache-matched-key == ''
-        run: |
-          mkdir -p work
-          if gh release download vcpkg-cache-seed --repo "${GITHUB_REPOSITORY}" --pattern 'vcpkg-cache.tar.part-*' --dir seed; then
-            cat seed/vcpkg-cache.tar.part-* | tar -xf - -C work
-            rm -rf seed
-          fi
-          du -sh work/* 2>/dev/null || true
+            ${{ matrix.arch }}-vcpkg-
 
       - name: Builder image
-        run: docker build -t aspia-armv7-builder arm/builder
+        run: docker build -t aspia-arm-builder arm/builder
 
+      # A step timeout (not the job one) leaves time to save the cache: the first build of all the
+      # dependencies may take longer than one run, the next run continues from the cache.
       - name: Build
-        id: build
+        timeout-minutes: 300
         run: |
           docker run --rm -v "${PWD}/work:/work" -v "${PWD}/arm/builder:/scripts:ro" \
-            aspia-armv7-builder bash /scripts/build.sh "${VERSION}"
-          sudo chown -R "$(id -u):$(id -g)" work
+            aspia-arm-builder bash /scripts/build.sh "${VERSION}" "${ARCH}"
+
+      # The main errors also go to the annotations of the run: they are visible without signing in.
+      - name: Build logs
+        if: failure()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" work || true
+          annotate() {
+            local text
+            text="$(head -c 60000 | awk 'BEGIN { ORS = "%0A" } { gsub(/%/, "%25"); gsub(/\r/, ""); print }')"
+            [[ -n "${text}" ]] || return 0
+            echo "::error title=${ARCH}: $1::${text}"
+          }
+          grep -h -E "^error:|failed with|BUILD_FAILED|CMake Error" work/vcpkg-install-*-"${ARCH}".log 2>/dev/null |
+            head -n 40 | annotate "vcpkg"
+          grep -h -A 25 "CMake Error" work/cmake-configure-*-"${ARCH}".log 2>/dev/null | head -n 80 | annotate "configure"
+          grep -h -B 2 -A 10 -E "error:|FAILED:" work/cmake-build-*-"${ARCH}".log 2>/dev/null | head -n 120 |
+            annotate "compiler"
+          find work/aspia-*/vcpkg4aspia/buildtrees -name '*-err.log' -size +0 2>/dev/null | head -n 3 |
+            while read -r log; do tail -n 40 "${log}" | annotate "$(basename "${log}")"; done
+          for log in work/vcpkg-install-*-"${ARCH}".log work/cmake-configure-*-"${ARCH}".log; do
+            [[ -f "${log}" ]] || continue
+            echo "::group::${log}"
+            tail -n 150 "${log}"
+            echo "::endgroup::"
+          done
+          if [[ -f "work/cmake-build-${VERSION}-${ARCH}.log" ]]; then
+            echo "::group::compiler errors"
+            grep -n -B 3 -A 12 -E "error:|FAILED:" "work/cmake-build-${VERSION}-${ARCH}.log" | head -n 300
+            echo "::endgroup::"
+          fi
+          # vcpkg writes the details of a failed port into buildtrees
+          find work/aspia-*/vcpkg4aspia/buildtrees -name '*-err.log' -newer arm/builder/build.sh 2>/dev/null |
+            while read -r log; do
+              echo "::group::${log}"
+              tail -n 80 "${log}"
+              echo "::endgroup::"
+            done
 
       # Saved even after a failure or a timeout: the next run continues with the packages built so far.
+      - name: Ownership of the build files
+        if: always() && steps.cache.outputs.cache-hit != 'true'
+        run: sudo chown -R "$(id -u):$(id -g)" work
+
       - name: Save the vcpkg cache
         if: always() && steps.cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
@@ -185,85 +219,27 @@ jobs:
           path: |
             work/vcpkg-cache
             work/vcpkg-downloads
-          key: armv7-vcpkg-${{ hashFiles('arm/builder/Dockerfile', 'arm/builder/triplets/**') }}-${{ github.run_id }}
-
-      - name: Remove the cache seed
-        if: success()
-        run: gh release delete vcpkg-cache-seed --repo "${GITHUB_REPOSITORY}" --yes 2>/dev/null || true
+          key: ${{ matrix.arch }}-vcpkg-${{ hashFiles('arm/builder/Dockerfile', 'arm/builder/triplets/**') }}-${{ github.run_id }}
 
       - name: Upload to the release
         run: |
           if ! gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            # both architectures may get here at the same time
             gh release create "${TAG}" --repo "${GITHUB_REPOSITORY}" --prerelease --target "${GITHUB_SHA}" \
               --title "Aspia ${VERSION} for ARM" \
-              --notes "Aspia Router + Relay ${VERSION} for ARM: archives for the self-update of the images \`aspia-server-arm\` and \`aspia-server-mikrotik\` (see docs/mikrotik-container.md). Built from https://github.com/${UPSTREAM}/releases/tag/v${VERSION}; armv7 is built by this repository, arm64 is taken from the CI of Aspia."
+              --notes "Aspia Router + Relay ${VERSION} for ARM (armv7, arm64): archives for the self-update of the images \`aspia-server-arm\` and \`aspia-server-mikrotik\` (see docs/mikrotik-container.md). Built by this repository from https://github.com/${UPSTREAM}/releases/tag/v${VERSION}." ||
+              gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null
           fi
-          gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "work/out/aspia-server-${VERSION}-linux-armv7"*
-
-  arm64:
-    needs: prepare
-    if: needs.prepare.outputs.get_arm64 == 'true'
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    outputs:
-      uploaded: ${{ steps.upload.outputs.uploaded }}
-    env:
-      VERSION: ${{ needs.prepare.outputs.version }}
-      TAG: ${{ needs.prepare.outputs.tag }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - name: Download the CI build of Aspia
-        run: |
-          sha="$(gh api "repos/${UPSTREAM}/commits/v${VERSION}" -q .sha)"
-          artifact="$(gh api "repos/${UPSTREAM}/actions/runs?head_sha=${sha}&per_page=50" -q '.workflow_runs[].id' |
-            while read -r run; do
-              gh api "repos/${UPSTREAM}/actions/runs/${run}/artifacts" \
-                -q '.artifacts[] | select(.name == "build-rpios12-arm64-release" and .expired == false) | .id'
-            done | head -n 1)"
-          if [[ -z "${artifact}" ]]; then
-            echo "::warning::No arm64 build of Aspia ${VERSION} (the artifacts are kept for 7 days)"
-            exit 1
-          fi
-          gh api "repos/${UPSTREAM}/actions/artifacts/${artifact}/zip" > arm64.zip
-          mkdir -p ci && unzip -q arm64.zip -d ci
-          find ci -name '*.deb' -printf '%f\n'
-
-      - name: Pack
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq upx-ucl
-          mkdir -p deb plain out
-          find ci \( -name 'aspia-router*.deb' -o -name 'aspia-relay*.deb' \) -exec dpkg-deb -x {} deb \;
-          for bin in aspia_router aspia_relay; do
-            cp "$(find deb -type f -name "${bin}" | head -n 1)" plain/
-          done
-          file plain/*
-          file plain/aspia_router | grep -q aarch64
-          pack() {
-            tar -czf "out/$2" -C "$1" aspia_router aspia_relay
-            (cd out && sha256sum "$2" > "$2.sha256")
-          }
-          pack plain "aspia-server-${VERSION}-linux-arm64.tar.gz"
-          cp -r plain upx
-          upx --best --lzma -q upx/aspia_router upx/aspia_relay
-          pack upx "aspia-server-${VERSION}-linux-arm64-upx.tar.gz"
-          ls -la out
-
-      - name: Upload to the release
-        id: upload
-        run: |
-          for _ in $(seq 1 60); do
-            gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 && break
-            sleep 60    # the armv7 job creates the release
-          done
-          gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber out/*
-          echo "uploaded=true" >> "$GITHUB_OUTPUT"
+          gh release upload "${TAG}" --repo "${GITHUB_REPOSITORY}" --clobber "work/out/aspia-server-${VERSION}-linux-${ARCH}"*
 
   images:
-    needs: [prepare, armv7, arm64]
-    # also when only the arm64 binaries were added to an already published version
+    needs: [prepare, build]
+    # Only when every architecture that had to be built is in the release: the next run builds the
+    # missing one again (from the cache) and publishes the images then.
     if: >-
-      always() && needs.armv7.result != 'failure' && needs.armv7.result != 'cancelled' &&
-      (needs.prepare.outputs.build_images == 'true' || needs.arm64.outputs.uploaded == 'true')
+      always() && needs.prepare.result == 'success' &&
+      needs.build.result != 'failure' && needs.build.result != 'cancelled' &&
+      needs.prepare.outputs.build_images == 'true'
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -315,23 +291,28 @@ jobs:
 
       - uses: docker/setup-buildx-action@v4
 
-      - name: Smoke test (armv7, emulated)
+      - name: Smoke test (emulated)
         env:
           AUTO_UPDATE: ${{ needs.prepare.outputs.legacy == 'true' && '0' || '1' }}
+          PLATFORMS: ${{ steps.bins.outputs.platforms }}
         run: |
-          for file in Dockerfile Dockerfile.mikrotik; do
-            docker buildx build --platform linux/arm/v7 --load -t "aspia-test:${file}" -f "arm/runtime/${file}" \
-              --build-arg "ASPIA_VERSION=${VERSION}" --build-arg "AUTO_UPDATE=${AUTO_UPDATE}" arm/runtime
-            docker run -d --name test --platform linux/arm/v7 -e EXTERNAL_IP=127.0.0.1 -e AUTO_UPDATE=0 "aspia-test:${file}"
-            ok=false
-            for _ in $(seq 1 36); do
-              sleep 5
-              docker exec test aspia_health >/dev/null 2>&1 && { ok=true; break; }
+          for platform in ${PLATFORMS//,/ }; do
+            for file in Dockerfile Dockerfile.mikrotik; do
+              echo "::group::${platform} ${file}"
+              docker buildx build --platform "${platform}" --load -t "aspia-test:${file}" -f "arm/runtime/${file}" \
+                --build-arg "ASPIA_VERSION=${VERSION}" --build-arg "AUTO_UPDATE=${AUTO_UPDATE}" arm/runtime
+              docker run -d --name test --platform "${platform}" -e EXTERNAL_IP=127.0.0.1 -e AUTO_UPDATE=0 "aspia-test:${file}"
+              ok=false
+              for _ in $(seq 1 36); do
+                sleep 5
+                docker exec test aspia_health >/dev/null 2>&1 && { ok=true; break; }
+              done
+              docker logs test 2>&1 | grep -v "Password:"
+              docker exec test aspia_router --version | grep -F "${VERSION}"
+              docker rm -f test
+              echo "::endgroup::"
+              [[ "${ok}" == "true" ]] || { echo "${platform} ${file}: the server did not become healthy"; exit 1; }
             done
-            docker logs test 2>&1 | grep -v "Password:"
-            docker exec test aspia_router --version | grep -F "${VERSION}"
-            docker rm -f test
-            [[ "${ok}" == "true" ]] || { echo "${file}: the server did not become healthy"; exit 1; }
           done
 
       - name: Log in to GHCR

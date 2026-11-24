@@ -1,20 +1,24 @@
-# Builder of Aspia Router and Relay for 32-bit ARM (armv7, armhf): cross compilation on x86_64,
-# Debian 12 as Raspberry Pi OS 12 used by the developer of Aspia. The armhf libraries let the build
-# run ARM tools through QEMU (binfmt of Docker Desktop or docker/setup-qemu-action).
+# Builder of Aspia Router and Relay for ARM: armv7 (armhf, 32-bit) and arm64 (aarch64), cross
+# compilation on x86_64, Debian 12 as Raspberry Pi OS 12 used by the developer of Aspia. The ARM
+# libraries let the build run ARM tools through QEMU (binfmt of Docker Desktop or
+# docker/setup-qemu-action).
 FROM debian:bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
 # The x86_64 part (the "host" triplet x64-linux: Qt tools moc/rcc run during the build) needs the
 # system GL/EGL/xkbcommon packages, as on the native machines of the developer.
-RUN dpkg --add-architecture armhf && apt-get update && apt-get install -y --no-install-recommends \
+RUN dpkg --add-architecture armhf && dpkg --add-architecture arm64 && apt-get update \
+    && apt-get install -y --no-install-recommends \
         ca-certificates curl git zip unzip tar xz-utils pkg-config file \
         build-essential crossbuild-essential-armhf libc6:armhf libstdc++6:armhf \
+        crossbuild-essential-arm64 libc6:arm64 libstdc++6:arm64 linux-libc-dev-arm64-cross \
         autoconf autoconf-archive automake libtool libltdl-dev bison flex gperf gettext \
         python3 python3-pip python3-venv python3-jinja2 perl nasm \
         linux-libc-dev-armhf-cross ninja-build \
         libgl-dev libegl-dev libopengl-dev libxkbcommon-dev libxkbcommon-x11-dev \
         libgl-dev:armhf libegl-dev:armhf libopengl-dev:armhf libsystemd-dev:armhf \
+        libgl-dev:arm64 libegl-dev:arm64 libopengl-dev:arm64 libsystemd-dev:arm64 \
     && rm -rf /var/lib/apt/lists/*
 
 # Newer CMake than Debian 12 has (vcpkg and Qt 6 need it), but not 4.x.
